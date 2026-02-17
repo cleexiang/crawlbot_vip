@@ -250,6 +250,7 @@ async def get_detail_info(page_obj, item):
     """
     try:
         if item.get('href'):
+            await asyncio.sleep(2)
             await page_obj.goto(item['href'], wait_until='networkidle')
             detail_info = await page_obj.evaluate(get_detail_info_js)
             item['sizes'] = detail_info.get('sizes', [])
