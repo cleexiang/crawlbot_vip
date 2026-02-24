@@ -5,6 +5,7 @@ from openpyxl.styles import Font
 from datetime import datetime
 import os
 import random
+import json
 
 get_page_number_js = r"""
 () => {
@@ -141,32 +142,77 @@ get_detail_info_js = r"""
 }
 """
 
-def write_items_to_excel(items, keyword, output_file='products.xlsx'):
+def get_progress_file(keyword):
+    """
+    获取进度文件路径
+    """
+    return f"data/{keyword}_progress.json"
+
+
+def load_progress(keyword):
+    """
+    读取抓取进度
+    返回：已完成的最后一页页码，如果没有进度则返回0
+    """
+    progress_file = get_progress_file(keyword)
+    if os.path.exists(progress_file):
+        try:
+            with open(progress_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                last_page = data.get('last_completed_page', 0)
+                print(f"📖 读取进度：上次已完成第 {last_page} 页")
+                return last_page
+        except Exception as e:
+            print(f"⚠️  读取进度文件失败: {e}")
+    return 0
+
+
+def save_progress(keyword, page):
+    """
+    保存抓取进度
+    """
+    progress_file = get_progress_file(keyword)
+
+    # 确保目录存在
+    os.makedirs(os.path.dirname(progress_file), exist_ok=True)
+
+    data = {
+        'keyword': keyword,
+        'last_completed_page': page,
+        'last_update_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    }
+
+    try:
+        with open(progress_file, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        print(f"💾 进度已保存：第 {page} 页")
+    except Exception as e:
+        print(f"⚠️  保存进度失败: {e}")
+
+
+def write_items_to_excel(items, keyword, page, output_file='products.xlsx'):
     """
     将items数据写入Excel文件，每个尺码对应一行数据
+    每页创建独立的Excel文件
     """
     # 确保输出目录存在
     output_dir = os.path.dirname(output_file)
     if output_dir and not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
-    # 检查文件是否存在，如果存在则加载，否则创建新文件
-    if os.path.exists(output_file):
-        wb = openpyxl.load_workbook(output_file)
-        ws = wb.active
-    else:
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        ws.title = "商品数据"
+    # 创建新文件（每页一个独立文件）
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "商品数据"
 
-        # 设置表头
-        headers = ["标题", "市场价", "尺码", "商品编码", "折扣", "品牌", "产品id", "详情页"]
-        ws.append(headers)
+    # 设置表头
+    headers = ["标题", "市场价", "尺码", "商品编码", "折扣", "品牌", "产品id", "详情页"]
+    ws.append(headers)
 
-        # 设置表头样式
-        header_font = Font(bold=True)
-        for cell in ws[1]:
-            cell.font = header_font
+    # 设置表头样式
+    header_font = Font(bold=True)
+    for cell in ws[1]:
+        cell.font = header_font
 
     # 写入数据 - 每个尺码对应一行
     total_rows = 0
@@ -209,7 +255,7 @@ def write_items_to_excel(items, keyword, output_file='products.xlsx'):
 
     # 保存文件
     wb.save(output_file)
-    print(f"✓ Excel文件已更新: {output_file}")
+    print(f"✓ Excel文件已保存: {output_file}")
     print(f"✓ 共导入 {total_rows} 条商品数据")
 
 
@@ -282,13 +328,13 @@ async def get_detail_info(page_obj, item, max_retries=3):
             # 随机延迟，模拟真实用户
             await asyncio.sleep(random.uniform(2, 4))
 
-            await page_obj.goto(item['href'], wait_until='networkidle', timeout=15000)
+            await page_obj.goto(item['href'], wait_until='load', timeout=30000)
 
             # 检测验证码
             has_captcha = await check_captcha(page_obj)
             if has_captcha:
                 # 验证码完成后重新加载页面
-                await page_obj.reload(wait_until='networkidle')
+                await page_obj.reload(wait_until='load')
 
             detail_info = await page_obj.evaluate(get_detail_info_js)
             item['sizes'] = detail_info.get('sizes', [])
@@ -336,11 +382,18 @@ async def get_items_of_page(keyword, page):
             for item in items:
                 await get_detail_info(page_obj, item)
 
-            # 获取数据后写入Excel，文件名为: keyword_YYYY-MM-DD.xlsx
+            # 获取数据后写入Excel，文件名为: keyword_YYYY-MM-DD_page_N.xlsx
             if items:
                 today = datetime.today().strftime('%Y-%m-%d')
-                output_file = f"data/{keyword}_{today}.xlsx"
-                write_items_to_excel(items, keyword, output_file)
+                output_file = f"data/{keyword}_{today}_page_{page}.xlsx"
+                write_items_to_excel(items, keyword, page, output_file)
+
+                # 保存进度
+                save_progress(keyword, page)
+            else:
+                print("⚠️  本页没有获取到商品数据")
+
+            return items
             
 async def main():
     keyword = "阿迪达斯"
@@ -349,16 +402,35 @@ async def main():
     total_page = await get_page_number(keyword=keyword)
 
     if total_page:
-        print(f"\n开始抓取 {keyword} 的商品数据，共 {total_page} 页")
-        print("=" * 50)
+        # 读取上次的进度
+        last_completed_page = load_progress(keyword)
 
-        # 遍历每一页
-        for page in range(1, total_page + 1):
+        # 计算起始页码
+        start_page = last_completed_page + 1
+
+        if start_page > total_page:
+            print(f"\n✓ {keyword} 的所有数据已抓取完成！")
+            return
+
+        print(f"\n开始抓取 {keyword} 的商品数据")
+        print(f"总页数: {total_page} | 起始页: {start_page} | 剩余页数: {total_page - start_page + 1}")
+        print("=" * 60)
+
+        # 从断点继续遍历每一页
+        for page in range(start_page, total_page + 1):
             print(f"\n【第 {page}/{total_page} 页】")
-            await get_items_of_page(keyword=keyword, page=page)
+            try:
+                await get_items_of_page(keyword=keyword, page=page)
+            except Exception as e:
+                print(f"✗ 第 {page} 页抓取失败: {e}")
+                print(f"⚠️  已保存进度到第 {page - 1} 页，下次运行将从第 {page} 页继续")
+                break
 
-        print("\n" + "=" * 50)
-        print(f"✓ {keyword} 的所有数据抓取完成！")
+        print("\n" + "=" * 60)
+        if last_completed_page > 0:
+            print(f"✓ {keyword} 的数据抓取完成！（从第 {start_page} 页继续）")
+        else:
+            print(f"✓ {keyword} 的所有数据抓取完成！")
 
 
 if __name__ == "__main__":
