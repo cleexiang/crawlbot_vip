@@ -244,22 +244,72 @@ async def human_scroll(page):
     print("✓ 页面滚动完成，无更多内容加载")
 
 
-async def get_detail_info(page_obj, item):
+async def check_captcha(page_obj):
+    """
+    检测页面是否出现验证码，如果有则弹出提示并等待用户处理
+    """
+    captcha_selectors = [
+        'div.nc_iframe_content',  # 网易易盾
+        'div[class*="captcha"]',
+        'div[class*="verify"]',
+        'div.ant-modal-content',
+        'iframe[title*="验证"]'
+    ]
+
+    for selector in captcha_selectors:
+        try:
+            element = await page_obj.query_selector(selector)
+            if element:
+                print(f"⚠️  检测到验证码，请在浏览器中完成验证，30秒后继续...")
+                await asyncio.sleep(30)  # 等待30秒让用户完成验证
+                return True
+        except:
+            pass
+
+    return False
+
+
+async def get_detail_info(page_obj, item, max_retries=3):
     """
     打开详情页并获取尺码和商品编码信息
+    带重试机制，遇到验证码会等待用户处理
     """
-    try:
-        if item.get('href'):
-            await asyncio.sleep(2)
-            await page_obj.goto(item['href'], wait_until='networkidle')
+    if not item.get('href'):
+        return item
+
+    for attempt in range(max_retries):
+        try:
+            # 随机延迟，模拟真实用户
+            await asyncio.sleep(random.uniform(2, 4))
+
+            await page_obj.goto(item['href'], wait_until='networkidle', timeout=15000)
+
+            # 检测验证码
+            has_captcha = await check_captcha(page_obj)
+            if has_captcha:
+                # 验证码完成后重新加载页面
+                await page_obj.reload(wait_until='networkidle')
+
             detail_info = await page_obj.evaluate(get_detail_info_js)
             item['sizes'] = detail_info.get('sizes', [])
             item['productCode'] = detail_info.get('productCode', '')
             print(f"✓ 获取详情: {item['name'][:20]} - 尺码数: {len(item['sizes'])} - 编码: {item['productCode']}")
-        return item
-    except Exception as e:
-        print(f"✗ 获取详情失败: {item['name'][:20]} - {str(e)}")
-        return item
+            return item
+
+        except Exception as e:
+            error_msg = str(e)
+            print(f"✗ 获取详情失败 (第{attempt + 1}次): {item['name'][:20]} - {error_msg}")
+
+            # 如果是超时错误，增加延迟后重试
+            if 'timeout' in error_msg.lower() or attempt < max_retries - 1:
+                wait_time = (attempt + 1) * 5  # 递增延迟：5s, 10s, 15s
+                print(f"  等待 {wait_time} 秒后重试...")
+                await asyncio.sleep(wait_time)
+            else:
+                print(f"  放弃获取该商品详情")
+                return item
+
+    return item
 
 
 async def get_items_of_page(keyword, page):
