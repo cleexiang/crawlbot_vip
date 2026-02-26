@@ -7,6 +7,8 @@ import os
 import random
 import json
 
+DETAIL_CONCURRENCY = 5  # 最大并发抓取详情页数量
+
 get_page_number_js = r"""
 () => {
   // 查找包含总页数的元素
@@ -229,7 +231,7 @@ def write_items_to_excel(items, keyword, page, output_file='products.xlsx'):
         for size in sizes:
             row = [
                 item.get('name', ''),           # 标题
-                item.get('salePrice', ''),    # 市场价
+                item.get('marketPrice', ''),    # 市场价
                 size,                           # 尺码
                 product_code,                   # 商品编码
                 item.get('discount', ''),       # 折扣
@@ -326,15 +328,14 @@ async def get_detail_info(page_obj, item, max_retries=3):
     for attempt in range(max_retries):
         try:
             # 随机延迟，模拟真实用户
-            await asyncio.sleep(random.uniform(2, 4))
 
-            await page_obj.goto(item['href'], wait_until='load', timeout=30000)
+            await page_obj.goto(item['href'], wait_until='domcontentloaded', timeout=30000)
 
             # 检测验证码
             has_captcha = await check_captcha(page_obj)
             if has_captcha:
                 # 验证码完成后重新加载页面
-                await page_obj.reload(wait_until='load')
+                await page_obj.reload(wait_until='domcontentloaded')
 
             detail_info = await page_obj.evaluate(get_detail_info_js)
             item['sizes'] = detail_info.get('sizes', [])
@@ -358,42 +359,72 @@ async def get_detail_info(page_obj, item, max_retries=3):
     return item
 
 
-async def get_items_of_page(keyword, page):
+async def detail_worker(context, item, sem):
+    async with sem:
+        page = await context.new_page()
+        try:
+            return await get_detail_info(page, item)
+        finally:
+            await page.close()
+
+
+async def get_items_of_page(keyword, page, browser):
     """
-    获取某某个商品某页的数据，并获取每个商品的详情信息
+    获取某个商品某页的数据，并并发获取每个商品的详情信息
     """
-    async with async_playwright() as p:
-        browser = await p.chromium.connect_over_cdp("http://localhost:9222")
-        contexts = browser.contexts
-        if contexts:
-            page_obj = contexts[0].pages[0]
-            await page_obj.goto(f"https://category.vip.com/suggest.php?keyword={keyword}&page={page}")
-            print(f"Current URL: {page_obj.url}")
+    contexts = browser.contexts
+    if not contexts:
+        print("未找到可用浏览器上下文")
+        return []
 
-            # 模拟用户滑动，加载所有商品数据
-            print("正在加载页面数据，请稍候...")
-            await human_scroll(page_obj)
+    list_page = contexts[0].pages[0]
 
-            items = await page_obj.evaluate(get_items_of_page_js)
-            print(f"✓ 获取到 {len(items)} 个商品")
+    await list_page.goto(f"https://category.vip.com/suggest.php?keyword={keyword}&page={page}")
+    print(f"Current URL: {list_page.url}")
 
-            # 逐个打开详情页获取尺码和商品编码
-            print("开始获取商品详情...")
-            for item in items:
-                await get_detail_info(page_obj, item)
+    print("正在加载页面数据，请稍候...")
+    await human_scroll(list_page)
 
-            # 获取数据后写入Excel，文件名为: keyword_YYYY-MM-DD_page_N.xlsx
-            if items:
-                today = datetime.today().strftime('%Y-%m-%d')
-                output_file = f"data/{keyword}_{today}_page_{page}.xlsx"
-                write_items_to_excel(items, keyword, page, output_file)
+    items = await list_page.evaluate(get_items_of_page_js)
+    print(f"✓ 获取到 {len(items)} 个商品")
 
-                # 保存进度
-                save_progress(keyword, page)
-            else:
-                print("⚠️  本页没有获取到商品数据")
+    if not items:
+        print("⚠️ 本页没有获取到商品数据")
+        return []
 
-            return items
+    print(f"开始并发获取商品详情（并发数: {DETAIL_CONCURRENCY}）...")
+
+    sem = asyncio.Semaphore(DETAIL_CONCURRENCY)
+
+    detail_contexts = []
+    for _ in range(DETAIL_CONCURRENCY):
+        ctx = await browser.new_context()
+
+        await ctx.route("**/*", lambda route:
+            route.abort()
+            if route.request.resource_type in ["image", "font", "media"]
+            else route.continue_()
+        )
+
+        detail_contexts.append(ctx)
+
+    tasks = [
+        detail_worker(detail_contexts[i % len(detail_contexts)], item, sem)
+        for i, item in enumerate(items)
+    ]
+
+    items = await asyncio.gather(*tasks)
+
+    for ctx in detail_contexts:
+        await ctx.close()
+
+    today = datetime.today().strftime('%Y-%m-%d')
+    output_file = f"data/{keyword}_{today}_page_{page}.xlsx"
+    write_items_to_excel(items, keyword, page, output_file)
+
+    save_progress(keyword, page)
+
+    return items
             
 async def main():
     keyword = "阿迪达斯"
@@ -416,15 +447,17 @@ async def main():
         print(f"总页数: {total_page} | 起始页: {start_page} | 剩余页数: {total_page - start_page + 1}")
         print("=" * 60)
 
-        # 从断点继续遍历每一页
-        for page in range(start_page, total_page + 1):
-            print(f"\n【第 {page}/{total_page} 页】")
-            try:
-                await get_items_of_page(keyword=keyword, page=page)
-            except Exception as e:
-                print(f"✗ 第 {page} 页抓取失败: {e}")
-                print(f"⚠️  已保存进度到第 {page - 1} 页，下次运行将从第 {page} 页继续")
-                break
+        async with async_playwright() as p:
+            browser = await p.chromium.connect_over_cdp("http://localhost:9222")
+
+            for page in range(start_page, total_page + 1):
+                print(f"\n【第 {page}/{total_page} 页】")
+                try:
+                    await get_items_of_page(keyword=keyword, page=page, browser=browser)
+                except Exception as e:
+                    print(f"✗ 第 {page} 页抓取失败: {e}")
+                    print(f"⚠️  已保存进度到第 {page - 1} 页，下次运行将从第 {page} 页继续")
+                    break
 
         print("\n" + "=" * 60)
         if last_completed_page > 0:
