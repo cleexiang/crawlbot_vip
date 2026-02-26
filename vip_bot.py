@@ -7,34 +7,27 @@ import os
 import random
 import json
 
-DETAIL_CONCURRENCY = 10  # 同时打开的详情页 tab 数量
-
 get_page_number_js = r"""
 () => {
   // 查找包含总页数的元素
   const span = document.querySelector('span.total-item-nums');
   if (!span) return null;
-  // 提取出“共27页”这种文本里的数字部分
+  // 提取出"共27页"这种文本里的数字部分
   const match = span.textContent.match(/共(\d+)页/);
   return match ? parseInt(match[1], 10) : null;
 }
 """
 
 
-async def get_page_number(keyword):
+async def get_page_number(keyword, page):
     """
-    获取某个商品的页数
+    获取某个商品的页数，复用已有的 page
     """
-    async with async_playwright() as p:
-        browser = await p.chromium.connect_over_cdp("http://localhost:9222")
-        contexts = browser.contexts
-        if contexts:
-            page = contexts[0].pages[0]
-            await page.goto(f"https://category.vip.com/suggest.php?keyword={keyword}")
-            print(f"Current URL: {page.url}")
-            page_number = await page.evaluate(get_page_number_js)
-            print(f"共：{page_number} 页")
-            return page_number
+    await page.goto(f"https://category.vip.com/suggest.php?keyword={keyword}")
+    print(f"Current URL: {page.url}")
+    page_number = await page.evaluate(get_page_number_js)
+    print(f"共：{page_number} 页")
+    return page_number
 
 
 get_items_of_page_js = r"""
@@ -274,8 +267,8 @@ async def human_scroll(page):
         await page.evaluate('window.scrollTo(0, document.documentElement.scrollHeight)')
         print(f"  已滑动到页面底部")
 
-        # 等待3秒让内容加载
-        await asyncio.sleep(3)
+        # 等待内容加载
+        await asyncio.sleep(1.5)
 
         # 获取当前页面高度
         current_height = await page.evaluate('document.documentElement.scrollHeight')
@@ -321,9 +314,7 @@ async def get_detail_info(page_obj, item, max_retries=3):
 
     for attempt in range(max_retries):
         try:
-            # 随机延迟，模拟真实用户
-
-            await page_obj.goto(item['href'], wait_until='load', timeout=30000)
+            await page_obj.goto(item['href'], wait_until='load', timeout=10000)
 
             # 检测验证码
             has_captcha = await check_captcha(page_obj)
@@ -353,96 +344,69 @@ async def get_detail_info(page_obj, item, max_retries=3):
     return item
 
 
-async def create_detail_page(context):
+async def setup_route(page):
     """
-    在已登录的 context 中创建一个用于抓详情的 tab，并设置资源拦截
+    为页面设置资源拦截，屏蔽图片、字体、媒体（captcha 相关的除外）
     """
-    detail_page = await context.new_page()
-
     async def block_resources(route):
-        if route.request.resource_type in ["image", "font", "media"] and "captcha" not in route.request.url:
+        if route.request.resource_type in ["image", "font", "media", "stylesheet"] and "captcha" not in route.request.url:
             await route.abort()
         else:
             await route.continue_()
 
-    await detail_page.route("**/*", block_resources)
-    return detail_page
+    await page.route("**/*", block_resources)
 
 
-async def detail_worker(worker_id, detail_pages, worker_index, context, queue, total):
+async def get_items_of_page(keyword, page_num, page):
     """
-    详情抓取 worker，从队列中取任务，用自己的 tab 抓取详情
-    如果 tab 被关闭则自动重建
+    获取某个商品某页的数据，用同一个 tab 完成列表抓取和详情抓取
     """
-    while True:
-        try:
-            index, item = queue.get_nowait()
-        except asyncio.QueueEmpty:
-            break
-
-        # 检查 tab 是否被关闭，如果关闭则重建
-        if detail_pages[worker_index].is_closed():
-            print(f"  [Tab{worker_id}] tab 已关闭，正在重建...")
-            detail_pages[worker_index] = await create_detail_page(context)
-
-        print(f"  [Tab{worker_id}] [{index + 1}/{total}] ", end="")
-        await get_detail_info(detail_pages[worker_index], item)
-        await asyncio.sleep(random.uniform(0.5, 1.5))
-
-
-async def get_items_of_page(keyword, page, list_page, detail_pages):
-    """
-    获取某个商品某页的数据，复用外部传入的 list_page 和 detail_pages tab
-    """
-    await list_page.goto(f"https://category.vip.com/suggest.php?keyword={keyword}&page={page}")
-    print(f"Current URL: {list_page.url}")
+    await page.goto(f"https://category.vip.com/suggest.php?keyword={keyword}&page={page_num}")
+    print(f"Current URL: {page.url}")
 
     print("正在加载页面数据，请稍候...")
-    await human_scroll(list_page)
+    await human_scroll(page)
 
-    items = await list_page.evaluate(get_items_of_page_js)
+    items = await page.evaluate(get_items_of_page_js)
     print(f"✓ 获取到 {len(items)} 个商品")
 
     if not items:
         print("⚠️ 本页没有获取到商品数据")
         return []
 
-    # 实际并发数不超过商品数
-    concurrency = min(len(detail_pages), len(items))
-    print(f"开始并发获取商品详情，共 {len(items)} 个，并发 tab 数: {concurrency}")
+    print(f"开始获取商品详情，共 {len(items)} 个...")
 
-    # 将所有商品放入队列
-    queue = asyncio.Queue()
     for i, item in enumerate(items):
-        queue.put_nowait((i, item))
-
-    # 启动 worker 并发抓取，复用已有的 detail tab
-    context = list_page.context
-    workers = [
-        detail_worker(wid + 1, detail_pages, wid, context, queue, len(items))
-        for wid in range(concurrency)
-    ]
-    await asyncio.gather(*workers)
+        print(f"  [{i + 1}/{len(items)}] ", end="")
+        await get_detail_info(page, item)
 
     today = datetime.today().strftime('%Y-%m-%d')
-    output_file = f"data/{keyword}_{today}_page_{page}.xlsx"
-    write_items_to_excel(items, keyword, page, output_file)
+    output_file = f"data/{keyword}_{today}_page_{page_num}.xlsx"
+    write_items_to_excel(items, keyword, page_num, output_file)
 
-    save_progress(keyword, page)
+    save_progress(keyword, page_num)
 
     return items
-            
+
+
 async def main():
     keyword = "阿迪达斯"
 
-    # 获取总页数
-    total_page = await get_page_number(keyword=keyword)
+    async with async_playwright() as p:
+        browser = await p.chromium.connect_over_cdp("http://localhost:9222")
+        context = browser.contexts[0]
+        page = context.pages[0]
+        await setup_route(page)
 
-    if total_page:
+        # 获取总页数（复用同一个 page）
+        total_page = await get_page_number(keyword=keyword, page=page)
+
+        if not total_page:
+            print("⚠️ 未获取到总页数")
+            return
+
         # 读取上次的进度
         last_completed_page = load_progress(keyword)
-
-        # 计算起始页码
         start_page = last_completed_page + 1
 
         if start_page > total_page:
@@ -453,46 +417,29 @@ async def main():
         print(f"总页数: {total_page} | 起始页: {start_page} | 剩余页数: {total_page - start_page + 1}")
         print("=" * 60)
 
-        async with async_playwright() as p:
-            browser = await p.chromium.connect_over_cdp("http://localhost:9222")
-            context = browser.contexts[0]
-            list_page = context.pages[0]
-
-            # 一次性创建所有 detail tab，后续所有页复用
-            detail_pages = []
-            for i in range(DETAIL_CONCURRENCY):
-                detail_pages.append(await create_detail_page(context))
-            print(f"✓ 已创建 {len(detail_pages)} 个详情 tab，全程复用")
-
+        for page_num in range(start_page, total_page + 1):
+            print(f"\n【第 {page_num}/{total_page} 页】")
             try:
-                for page in range(start_page, total_page + 1):
-                    print(f"\n【第 {page}/{total_page} 页】")
-                    try:
-                        await get_items_of_page(keyword=keyword, page=page, list_page=list_page, detail_pages=detail_pages)
-                    except Exception as e:
-                        print(f"✗ 第 {page} 页抓取失败: {e}")
-                        print(f"⚠️  已保存进度到第 {page - 1} 页，下次运行将从第 {page} 页继续")
-                        break
-            finally:
-                # 全部完成后关闭 detail tab（跳过已关闭的）
-                for dp in detail_pages:
-                    if not dp.is_closed():
-                        await dp.close()
+                await get_items_of_page(keyword=keyword, page_num=page_num, page=page)
+            except Exception as e:
+                print(f"✗ 第 {page_num} 页抓取失败: {e}")
+                print(f"⚠️  已保存进度到第 {page_num - 1} 页，下次运行将从第 {page_num} 页继续")
+                break
 
-        print("\n" + "=" * 60)
-        if last_completed_page > 0:
-            print(f"✓ {keyword} 的数据抓取完成！（从第 {start_page} 页继续）")
-        else:
-            print(f"✓ {keyword} 的所有数据抓取完成！")
+    print("\n" + "=" * 60)
+    if last_completed_page > 0:
+        print(f"✓ {keyword} 的数据抓取完成！（从第 {start_page} 页继续）")
+    else:
+        print(f"✓ {keyword} 的所有数据抓取完成！")
 
 
 async def test_first_page():
     """
-    测试阿迪达斯第一页的并发抓取情况
+    测试阿迪达斯第一页的抓取情况
     """
     keyword = "阿迪达斯"
     print("=" * 60)
-    print(f"测试开始：{keyword} 第1页并发抓取")
+    print(f"测试开始：{keyword} 第1页抓取")
     print("=" * 60)
 
     start_time = datetime.now()
@@ -500,19 +447,11 @@ async def test_first_page():
     async with async_playwright() as p:
         browser = await p.chromium.connect_over_cdp("http://localhost:9222")
         context = browser.contexts[0]
-        list_page = context.pages[0]
+        page = context.pages[0]
+        await setup_route(page)
 
-        detail_pages = []
-        for i in range(DETAIL_CONCURRENCY):
-            detail_pages.append(await create_detail_page(context))
-        print(f"✓ 已创建 {len(detail_pages)} 个详情 tab")
+        items = await get_items_of_page(keyword=keyword, page_num=1, page=page)
 
-        try:
-            items = await get_items_of_page(keyword=keyword, page=1, list_page=list_page, detail_pages=detail_pages)
-        finally:
-            for dp in detail_pages:
-                if not dp.is_closed():
-                    await dp.close()
 
     elapsed = (datetime.now() - start_time).total_seconds()
 
