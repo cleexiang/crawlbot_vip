@@ -105,31 +105,12 @@ get_detail_info_js = r"""
     result.sizes = Array.from(sizeElements).map(el => el.textContent.trim());
   }
 
-  // 抓取商品编码 - 方法1：在tbody中查找
-  const tbody = document.querySelector('tbody.J_dc_table');
-  if (tbody) {
-    const thElements = tbody.querySelectorAll('th.dc-table-tit');
-    for (let th of thElements) {
-      if (th.textContent.includes('商品编码')) {
-        // 找到最近的td兄弟元素
-        let nextEl = th.nextElementSibling;
-        while (nextEl && nextEl.tagName !== 'TD') {
-          nextEl = nextEl.nextElementSibling;
-        }
-        if (nextEl) {
-          result.productCode = nextEl.textContent.trim();
-          break;
-        }
-      }
-    }
-  }
-
-  // 如果还没有找到，尝试方法2：查找整个页面中包含"商品编码"的元素
-  if (!result.productCode) {
-    const allText = document.body.innerText;
-    const match = allText.match(/商品编码[：:]\s*([A-Z0-9]+)/);
+  // 抓取商品编码
+  const barCodeEl = document.querySelector('p#J_detail_barCode');
+  if (barCodeEl) {
+    const match = barCodeEl.textContent.match(/商品编码[：:]\s*(.+)/);
     if (match) {
-      result.productCode = match[1];
+      result.productCode = match[1].trim();
     }
   }
 
@@ -322,6 +303,9 @@ async def get_detail_info(page_obj, item, max_retries=3):
                 # 验证码完成后重新加载页面
                 await page_obj.reload(wait_until='load')
 
+            # 等待异步填充的关键元素出现
+            await page_obj.wait_for_selector('p#J_detail_barCode', timeout=10000)
+
             detail_info = await page_obj.evaluate(get_detail_info_js)
             item['sizes'] = detail_info.get('sizes', [])
             item['productCode'] = detail_info.get('productCode', '')
@@ -349,7 +333,7 @@ async def setup_route(page):
     为页面设置资源拦截，屏蔽图片、字体、媒体（captcha 相关的除外）
     """
     async def block_resources(route):
-        if route.request.resource_type in ["image", "font", "media", "stylesheet"] and "captcha" not in route.request.url:
+        if route.request.resource_type in ["image", "font", "media"] and "captcha" not in route.request.url:
             await route.abort()
         else:
             await route.continue_()
@@ -426,6 +410,8 @@ async def main():
                 print(f"⚠️  已保存进度到第 {page_num - 1} 页，下次运行将从第 {page_num} 页继续")
                 break
 
+        await page.unroute("**/*")
+
     print("\n" + "=" * 60)
     if last_completed_page > 0:
         print(f"✓ {keyword} 的数据抓取完成！（从第 {start_page} 页继续）")
@@ -451,7 +437,7 @@ async def test_first_page():
         await setup_route(page)
 
         items = await get_items_of_page(keyword=keyword, page_num=1, page=page)
-
+        await page.unroute("**/*")
 
     elapsed = (datetime.now() - start_time).total_seconds()
 
@@ -474,9 +460,45 @@ async def test_first_page():
     print("=" * 60)
 
 
+async def test_detail(url):
+    """
+    测试单个商品详情页的数据抓取
+    用法: python vip_bot.py detail <商品详情页URL>
+    """
+    print("=" * 60)
+    print(f"测试单个详情页抓取")
+    print(f"URL: {url}")
+    print("=" * 60)
+
+    async with async_playwright() as p:
+        browser = await p.chromium.connect_over_cdp("http://localhost:9222")
+        context = browser.contexts[0]
+        page = context.pages[0]
+        await setup_route(page)
+
+        item = {'href': url, 'name': '测试商品'}
+        await get_detail_info(page, item)
+        await page.unroute("**/*")
+
+    print("\n" + "=" * 60)
+    print("抓取结果")
+    print("=" * 60)
+    sizes = item.get('sizes', [])
+    product_code = item.get('productCode', '')
+    print(f"商品编码      : {product_code or '未获取到'}")
+    print(f"尺码数量      : {len(sizes)}")
+    if sizes:
+        print(f"尺码列表      : {', '.join(sizes)}")
+    else:
+        print(f"尺码列表      : 未获取到")
+    print("=" * 60)
+
+
 if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == "test":
         asyncio.run(test_first_page())
+    elif len(sys.argv) > 2 and sys.argv[1] == "detail":
+        asyncio.run(test_detail(sys.argv[2]))
     else:
         asyncio.run(main())
